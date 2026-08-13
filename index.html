@@ -10,7 +10,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="theme-color" content="#0b0d12" />
-<title>B3DD · 3D Depth &amp; Movement Scanner</title>
+<title>B3DD · Movement &amp; Video Scanner</title>
 <style>
   :root {
     --bg: #0b0d12;
@@ -217,7 +217,7 @@
   <main class="app">
     <header>
       <h1>B3DD Scanner</h1>
-      <p class="subtitle">Capture camera frames, device movement and depth — export a single <code>.b3dd</code> file. 100% on-device.</p>
+      <p class="subtitle">Record a video and track your phone's position &amp; rotation — export a single <code>.b3dd</code> file. 100% on-device.</p>
     </header>
 
     <!-- Live camera preview. playsinline/autoplay/muted are also asserted in JS. -->
@@ -233,20 +233,20 @@
         <span class="value" id="statDuration">00:00.0</span>
       </div>
       <div class="stat">
-        <span class="label">Frames</span>
-        <span class="value" id="statFrames">0</span>
+        <span class="label">Video</span>
+        <span class="value" id="statVideo">0 MB</span>
+      </div>
+      <div class="stat">
+        <span class="label">Trajectory</span>
+        <span class="value" id="statTraj">0</span>
       </div>
       <div class="stat">
         <span class="label">Orientation α/β/γ</span>
-        <span class="value small" id="statOrientation">—</span>
+        <span class="value small" id="statOrient">—</span>
       </div>
       <div class="stat">
         <span class="label">Position x/y/z (m)</span>
-        <span class="value small" id="statPosition">—</span>
-      </div>
-      <div class="stat">
-        <span class="label">Est. export size</span>
-        <span class="value" id="statSize">—</span>
+        <span class="value small" id="statPos">—</span>
       </div>
       <div class="stat">
         <span class="label">Status</span>
@@ -262,36 +262,34 @@
 
     <div class="notice" id="notice"></div>
     <p class="footnote">
-      Requires HTTPS (GitHub Pages provides it). On devices without WebXR depth sensing,
-      a luminance-based depth estimate is recorded from the video stream.
+      Requires HTTPS (GitHub Pages provides it). The camera feed is recorded as a
+      video while device position &amp; rotation are logged alongside it — nothing
+      leaves the device.
     </p>
   </main>
 
 <script>
 /* ============================================================================
- * B3DD — Browser 3D Depth & Movement Scanner
+ * B3DD — Browser Movement & Video Scanner (simplified)
  * ----------------------------------------------------------------------------
- * Single-file, zero-backend scanner for iOS/mobile browsers.
+ * Single-file, zero-backend recorder for iOS/mobile browsers.
  *
- *   Camera   : getUserMedia -> <video> -> offscreen <canvas> (downsampled JPEG)
- *   Motion   : WebXR getViewerPose (primary) -> DeviceMotion/DeviceOrientation
- *   Depth    : XRDepthInformation (primary) -> luminance fallback from video
- *   Export   : JSON object -> Blob -> .b3dd download
+ *   Camera   : getUserMedia -> <video> preview + MediaRecorder (mp4/webm)
+ *   Motion   : DeviceMotion / DeviceOrientation (iOS permission-gated)
+ *   Export   : one .b3dd JSON = { header, trajectory, video (base64) }
  *
- * Everything runs client-side; no data ever leaves the device.
+ * WebXR and per-frame depth capture were removed: iOS Safari has no WebXR, so
+ * that path could never run. What remains is the part that actually works.
  * ========================================================================== */
 
 "use strict";
 
 /* ------------------------------- Config ---------------------------------- */
 const CONFIG = {
-  targetFps: 10,          // capture cadence (5-10 FPS keeps memory bounded)
-  colorMaxWidth: 640,     // downsampled color frame max width (px)
-  depthMaxWidth: 160,     // depth/grayscale frame max width (px)
-  jpegQuality: 0.70,      // color JPEG quality (0..1)
-  depthQuality: 0.60,     // depth JPEG quality (0..1)
-  maxFrames: 900,         // hard cap => ~90s at 10 FPS, prevents mobile OOM
-  gravity: 9.81,          // m/s^2, used to strip gravity from raw accel
+  trajectoryRate: 20,        // Hz — how often position/rotation is logged
+  maxDurationMs: 60000,      // auto-stop after 60s (bounds memory / file size)
+  videoBitsPerSecond: 2500000, // ~2.5 Mbps keeps a 60s video ~18 MB
+  gravity: 9.81,             // m/s^2, used to strip gravity from raw accel
 };
 
 /* ---------------------------- DOM references ------------------------------ */
@@ -301,51 +299,32 @@ const btnStart     = document.getElementById("btnStart");
 const btnStop      = document.getElementById("btnStop");
 const noticeEl     = document.getElementById("notice");
 const statDuration = document.getElementById("statDuration");
-const statFrames   = document.getElementById("statFrames");
-const statOrient   = document.getElementById("statOrientation");
-const statPos      = document.getElementById("statPosition");
-const statSize     = document.getElementById("statSize");
+const statVideo    = document.getElementById("statVideo");
+const statTraj     = document.getElementById("statTraj");
+const statOrient   = document.getElementById("statOrient");
+const statPos      = document.getElementById("statPos");
 const statState    = document.getElementById("statState");
 const capsEl       = document.getElementById("caps");
 
-/* Offscreen canvases (never shown in the DOM). */
-const colorCanvas = document.createElement("canvas");
-const colorCtx    = colorCanvas.getContext("2d", { willReadFrequently: false });
-const depthCanvas = document.createElement("canvas");
-const depthCtx    = depthCanvas.getContext("2d", { willReadFrequently: true });
-
 /* ----------------------------- App state --------------------------------- */
 const state = {
-  status: "idle",             // idle | starting | recording | stopped | error
+  status: "idle",             // idle | starting | recording | exporting | stopped | error
   stream: null,
-  rafId: null,
-  frameInterval: 1000 / CONFIG.targetFps, // ms between captures
-  lastFrameTime: 0,
+  recorder: null,
+  chunks: [],                 // MediaRecorder data chunks (Blobs)
+  mimeType: "",               // chosen recording container (e.g. video/mp4)
+  trajTimerId: null,          // trajectory sampler interval
   startTime: 0,
-
-  // canvas dimensions (computed from the video stream)
-  colorW: 0, colorH: 0,
-  depthW: 0, depthH: 0,
 
   // orientation (degrees) & raw acceleration (m/s^2)
   alpha: 0, beta: 0, gamma: 0,
-  accel: { x: 0, y: 0, z: 0 },
 
-  // dead-reckoning integrators for the fallback pose
+  // dead-reckoning integrators for the position estimate
   vel: { x: 0, y: 0, z: 0 },
   pos: { x: 0, y: 0, z: 0 },
   lastMotionTime: 0,
 
-  // WebXR
-  xrSession: null,
-  xrReferenceSpace: null,
-  latestXRPose: null,
-  latestXRPoseTime: 0,
-  latestDepthInfo: null,
-  usedXRDepth: false,        // true once a real XR depth buffer is recorded
-
-  // captured data
-  frames: [],
+  // recorded data
   trajectory: [],
 };
 
@@ -353,50 +332,41 @@ const state = {
  * Capability detection
  * ========================================================================== */
 function detectCapabilities() {
-  const hasXR = "xr" in navigator && !!navigator.xr;
-  const hasGetUserMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
-  const hasMotion = "DeviceMotionEvent" in window;
-  const needsMotionPerm =
-    hasMotion &&
-    typeof DeviceMotionEvent.requestPermission === "function";
+  const hasCamera  = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  const hasMotion  = "DeviceMotionEvent" in window;
+  const needsPerm  = hasMotion && typeof DeviceMotionEvent.requestPermission === "function";
+  const hasRecorder = typeof MediaRecorder !== "undefined";
+  const mime = pickMimeType();
 
   const chips = [
-    ["WebXR", hasXR],
-    ["Camera", hasGetUserMedia],
+    ["Camera", hasCamera],
     ["Motion", hasMotion],
-    ["Motion perm req.", needsMotionPerm],
+    ["Motion perm req.", needsPerm],
+    ["Recorder", hasRecorder ? (mime || "default") : "no"],
   ];
   capsEl.innerHTML = "";
   chips.forEach(([label, ok]) => {
     const s = document.createElement("span");
-    s.textContent = label + ": " + (ok ? "yes" : "no");
-    s.className = ok ? "on" : "off";
+    s.textContent = label + ": " + ok;
+    s.className = ok && ok !== "no" ? "on" : "off";
     capsEl.appendChild(s);
   });
-
-  // WebXR depth sensing support is confirmed asynchronously during start.
-  if (hasXR) {
-    navigator.xr.isSessionSupported("inline")
-      .then((ok) => setChip("Depth session", ok))
-      .catch(() => setChip("Depth session", false));
-  } else {
-    setChip("Depth session", false);
-  }
-  setChip("Depth source", "luminance fallback");
 }
 
-function setChip(label, value) {
-  const txt = label + ": " + value;
-  for (const s of capsEl.children) {
-    if (s.textContent.startsWith(label + ":")) {
-      s.textContent = txt;
-      s.className = String(value) === "yes" ? "on" : "off";
-      return;
-    }
+/* Pick the best MediaRecorder container this browser supports. iOS Safari only
+ * understands MP4; Chrome/Android prefers WebM. Returns "" to use the default. */
+function pickMimeType() {
+  if (typeof MediaRecorder === "undefined" || !MediaRecorder.isTypeSupported) return "";
+  const candidates = [
+    "video/mp4;codecs=avc1",
+    "video/mp4",
+    "video/webm;codecs=vp9",
+    "video/webm",
+  ];
+  for (const c of candidates) {
+    try { if (MediaRecorder.isTypeSupported(c)) return c; } catch (_) { /* ignore */ }
   }
-  const s = document.createElement("span");
-  s.textContent = txt;
-  capsEl.appendChild(s);
+  return "";
 }
 
 /* ============================================================================
@@ -426,30 +396,24 @@ function fmtDuration(ms) {
 function fmt(v, d) {
   return (v == null || !isFinite(v)) ? "—" : Number(v).toFixed(d == null ? 2 : d);
 }
+function fmtMB(bytes) {
+  return (bytes / 1048576).toFixed(2) + " MB";
+}
+
+/* Live size of the video captured so far (sum of MediaRecorder chunks). */
+function videoSizeBytes() {
+  return state.chunks.reduce((s, c) => s + (c.size || 0), 0);
+}
 
 function updateStatusPanel() {
-  statFrames.textContent = String(state.frames.length);
+  statTraj.textContent = String(state.trajectory.length);
+  statVideo.textContent = fmtMB(videoSizeBytes());
   statOrient.textContent =
     fmt(state.alpha, 0) + "° / " + fmt(state.beta, 0) + "° / " + fmt(state.gamma, 0) + "°";
   statPos.textContent = fmt(state.pos.x) + " / " + fmt(state.pos.y) + " / " + fmt(state.pos.z);
   if (state.status === "recording") {
     statDuration.textContent = fmtDuration(performance.now() - state.startTime);
-    statSize.textContent = estimateSize();
   }
-}
-
-/* Rough export-size estimate so users can see memory usage live. */
-function estimateSize() {
-  let bytes = 512; // header + trajectory overhead
-  state.frames.forEach((f) => {
-    bytes += (f.color ? f.color.length : 0) * 0.75; // base64 -> ~3/4 bytes
-    bytes += (f.depth ? f.depth.length : 0) * 0.75;
-    bytes += 160;
-  });
-  state.trajectory.forEach(() => (bytes += 96));
-  if (bytes < 1024) return "—";
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + " KB";
-  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
 }
 
 /* ============================================================================
@@ -471,7 +435,6 @@ async function startCamera() {
   try {
     state.stream = await navigator.mediaDevices.getUserMedia(constraints);
   } catch (err) {
-    // Some devices reject the "ideal" facingMode — retry with plain video.
     try {
       state.stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
     } catch (err2) {
@@ -502,7 +465,55 @@ function stopCamera() {
 }
 
 /* ============================================================================
- * 2. MOTION — permissions + listeners (iOS specifics)
+ * 2. VIDEO — MediaRecorder
+ * ========================================================================== */
+function startRecorder() {
+  state.chunks = [];
+  const opts = { videoBitsPerSecond: CONFIG.videoBitsPerSecond };
+  if (state.mimeType) opts.mimeType = state.mimeType;
+
+  const rec = new MediaRecorder(state.stream, opts);
+  // Record the browser's actual container choice (accurate even when our
+  // preferred mimeType was unsupported and it fell back to the default).
+  state.mimeType = rec.mimeType || state.mimeType;
+
+  // Collect data in ~1s slices so we can show a live size and avoid one giant blob.
+  rec.ondataavailable = (e) => {
+    if (e.data && e.data.size) state.chunks.push(e.data);
+  };
+  rec.onerror = (e) => {
+    showNotice("Recorder error: " + ((e.error && e.error.message) || "unknown"), "error");
+  };
+  rec.start(1000);
+  state.recorder = rec;
+}
+
+/* Stop the recorder, assemble the chunks into a Blob, and base64-encode it into
+ * a data URL. Resolves with { dataUrl, bytes } or null if nothing was recorded. */
+function stopRecorderAndEncode() {
+  return new Promise((resolve) => {
+    const rec = state.recorder;
+    if (!rec || rec.state === "inactive") { resolve(null); return; }
+
+    rec.onstop = () => {
+      const type = state.mimeType || "video/mp4";
+      const blob = new Blob(state.chunks, { type });
+      const bytes = blob.size;
+      state.chunks = [];
+      state.recorder = null;
+
+      if (!bytes) { resolve(null); return; }
+      const reader = new FileReader();
+      reader.onload  = () => resolve({ dataUrl: reader.result, bytes });
+      reader.onerror = () => resolve({ dataUrl: null, bytes });
+      reader.readAsDataURL(blob);
+    };
+    try { rec.stop(); } catch (_) { resolve(null); }
+  });
+}
+
+/* ============================================================================
+ * 3. MOTION — permissions + listeners (iOS specifics)
  * ========================================================================== */
 
 /*
@@ -521,8 +532,7 @@ async function requestMotionPermission() {
     results.push(await DeviceMotionEvent.requestPermission());
   }
   if (results.some((r) => r !== "granted")) {
-    // Permission may be "denied" or absent — motion will simply be unavailable.
-    throw new Error("Motion & orientation permission was denied. Trajectory tracking disabled.");
+    throw new Error("Motion & orientation permission was denied. Position tracking disabled.");
   }
 }
 
@@ -552,8 +562,8 @@ function onDeviceMotion(e) {
   const q = quatFromEuler(state.alpha, state.beta, state.gamma);
 
   if (!lin || lin.x == null || lin.y == null || lin.z == null) {
-    // Fallback: estimate gravity in the device frame using the current
-    // attitude and subtract it from the raw reading.
+    // Estimate gravity in the device frame using the current attitude and
+    // subtract it from the raw reading.
     const gDevice = quatRotate(quatConjugate(q), { x: 0, y: 0, z: CONFIG.gravity });
     lin = {
       x: incl.x - gDevice.x,
@@ -565,8 +575,8 @@ function onDeviceMotion(e) {
   // Rotate linear acceleration into the world frame.
   const aWorld = quatRotate(q, { x: lin.x || 0, y: lin.y || 0, z: lin.z || 0 });
 
-  // Dead-reckoning double integration. NOTE: this drifts over time and is
-  // only an approximation — WebXR poses replace it when available.
+  // Dead-reckoning double integration. NOTE: this drifts over time — it is a
+  // best-effort position estimate without the WebXR/SLAM hardware iOS withholds.
   const now = performance.now();
   const dt = state.lastMotionTime
     ? Math.min(0.1, (now - state.lastMotionTime) / 1000)
@@ -579,8 +589,6 @@ function onDeviceMotion(e) {
   state.pos.x += state.vel.x * dt;
   state.pos.y += state.vel.y * dt;
   state.pos.z += state.vel.z * dt;
-
-  state.accel = { x: incl.x, y: incl.y, z: incl.z };
 }
 
 /* ------------------------- Quaternion helpers ---------------------------- */
@@ -619,264 +627,60 @@ function quatRotate(q, v) {
 }
 
 /* ============================================================================
- * 3. WebXR — primary pose + depth path (optional; falls back cleanly)
+ * 4. TRAJECTORY SAMPLER — snapshot position/rotation at a fixed rate
  * ========================================================================== */
-
-/*
- * WebXR is the primary metric source when supported. We request an *inline*
- * session (rather than immersive-ar) so it can coexist with the DOM camera
- * preview. On iOS Safari `navigator.xr` does not exist, so this whole path is
- * skipped and the DeviceMotion fallback is used instead.
- */
-async function startXR() {
-  if (!navigator.xr) { setChip("Depth source", "luminance fallback"); return; }
-  try {
-    const ok = await navigator.xr.isSessionSupported("inline");
-    if (!ok) { setChip("Depth source", "luminance fallback"); return; }
-
-    const session = await navigator.xr.requestSession("inline", {
-      optionalFeatures: ["depth-sensing"],
-      depthSensing: {
-        usagePreference: ["cpu-optimized", "gpu-optimized"],
-        dataFormatPreference: ["luminance-alpha", "float32"],
-      },
-    });
-    state.xrSession = session;
-    state.xrReferenceSpace = await session.requestReferenceSpace("local");
-    setChip("Depth session", "yes");
-    session.requestAnimationFrame(onXRFrame);
-  } catch (err) {
-    // WebXR unavailable or rejected — silently use the fallback pipeline.
-    console.warn("WebXR unavailable:", err);
-    state.xrSession = null;
-    setChip("Depth source", "luminance fallback");
-  }
-}
-
-function onXRFrame(time, frame) {
-  if (!state.xrSession) return;
-  state.xrSession.requestAnimationFrame(onXRFrame);
-
-  // --- Pose -------------------------------------------------------------
-  const pose = frame.getViewerPose(state.xrReferenceSpace);
-  if (pose && pose.transform) {
-    const p = pose.transform.position;
-    const o = pose.transform.orientation;
-    state.latestXRPose = { x: p.x, y: p.y, z: p.z, qx: o.x, qy: o.y, qz: o.z, qw: o.w };
-    state.latestXRPoseTime = performance.now();
-  }
-
-  // --- Depth (XRDepthInformation) ---------------------------------------
-  try {
-    if (pose && typeof frame.getDepthInformation === "function") {
-      for (const view of pose.views) {
-        const depthInfo = frame.getDepthInformation(view);
-        if (depthInfo) {
-          state.latestDepthInfo = depthInfo;
-          break;
-        }
-      }
-    }
-  } catch (_) { /* depth not provided this frame */ }
-}
-
-function stopXR() {
-  if (state.xrSession) {
-    try { state.xrSession.end(); } catch (_) { /* already ended */ }
-    state.xrSession = null;
-  }
-}
-
-/* Convert an XRDepthInformation buffer into a normalized grayscale canvas
- * image. Near surfaces are bright, far surfaces are dark. */
-function renderXRDepth(depthInfo) {
-  const w = depthInfo.width;
-  const h = depthInfo.height;
-  if (!w || !h) return { data: null, width: 0, height: 0 };
-
-  depthCanvas.width = w;
-  depthCanvas.height = h;
-  const img = depthCtx.createImageData(w, h);
-
-  const data = depthInfo.data;
-  const toMeters = typeof depthInfo.rawValueToMeters === "function"
-    ? depthInfo.rawValueToMeters
-    : (v) => v;
-
-  // First pass: min/max in meters for normalization.
-  let min = Infinity, max = -Infinity;
-  const meters = new Float32Array(w * h);
-  for (let i = 0; i < w * h; i++) {
-    const raw = data instanceof Float32Array ? data[i] : data[i * 2]; // luminance-alpha -> first byte
-    const m = toMeters(raw);
-    meters[i] = m;
-    if (m < min) min = m;
-    if (m > max) max = m;
-  }
-  const range = max - min || 1;
-
-  // Second pass: map to 0..255 grayscale (inverted: near = bright).
-  for (let i = 0; i < w * h; i++) {
-    const v = Math.max(0, Math.min(255, Math.round(((max - meters[i]) / range) * 255)));
-    img.data[i * 4]     = v;
-    img.data[i * 4 + 1] = v;
-    img.data[i * 4 + 2] = v;
-    img.data[i * 4 + 3] = 255;
-  }
-  depthCtx.putImageData(img, 0, 0);
-
-  return {
-    data: depthCanvas.toDataURL("image/jpeg", CONFIG.depthQuality),
-    width: w,
-    height: h,
-  };
-}
-
-/* ============================================================================
- * 4. FRAME CAPTURE — color + depth downsampling (memory safeguards)
- * ========================================================================== */
-
-/* Compute downsampled canvas sizes from the native video resolution once the
- * stream's metadata arrives. */
-function setupCanvasSizes() {
-  const vw = video.videoWidth;
-  const vh = video.videoHeight;
-  if (!vw || !vh) return;
-
-  const colorScale = Math.min(1, CONFIG.colorMaxWidth / vw);
-  state.colorW = Math.max(1, Math.round(vw * colorScale));
-  state.colorH = Math.max(1, Math.round(vh * colorScale));
-  colorCanvas.width = state.colorW;
-  colorCanvas.height = state.colorH;
-
-  const depthScale = CONFIG.depthMaxWidth / vw;
-  state.depthW = Math.max(1, Math.round(vw * depthScale));
-  state.depthH = Math.max(1, Math.round(vh * depthScale));
-  depthCanvas.width = state.depthW;
-  depthCanvas.height = state.depthH;
-}
-
-/* Draw the current video frame into the downsampled color canvas and return a
- * JPEG data URL. Small resolution + JPEG keeps the capture memory-light. */
-function captureColorFrame() {
-  colorCtx.drawImage(video, 0, 0, state.colorW, state.colorH);
-  return colorCanvas.toDataURL("image/jpeg", CONFIG.jpegQuality);
-}
-
-/* Depth for this frame:
- *   - Prefer a fresh XRDepthInformation buffer (real metric depth).
- *   - Otherwise downsample the color frame and keep its luminance as a
- *     cheap "depth proxy" (brighter = closer is only approximate). */
-function captureDepthFrame() {
-  const fresh = state.latestDepthInfo &&
-    (performance.now() - state.latestXRPoseTime) < 250;
-  if (fresh) {
-    state.usedXRDepth = true;
-    setChip("Depth source", "webxr-depth");
-    return renderXRDepth(state.latestDepthInfo);
-  }
-
-  // Luminance fallback.
-  depthCanvas.width = state.depthW;
-  depthCanvas.height = state.depthH;
-  depthCtx.drawImage(video, 0, 0, state.depthW, state.depthH);
-  const img = depthCtx.getImageData(0, 0, state.depthW, state.depthH);
-  const d = img.data;
-  for (let i = 0; i < d.length; i += 4) {
-    const lum = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
-    d[i] = d[i + 1] = d[i + 2] = lum;
-  }
-  depthCtx.putImageData(img, 0, 0);
-  return {
-    data: depthCanvas.toDataURL("image/jpeg", CONFIG.depthQuality),
-    width: state.depthW,
-    height: state.depthH,
-  };
-}
-
-/* Current metric pose: WebXR if fresh, else the integrated fallback pose
- * combined with a quaternion derived from the live orientation. */
-function getCurrentPose() {
-  if (state.latestXRPose &&
-      (performance.now() - state.latestXRPoseTime) < 250) {
-    const p = state.latestXRPose;
-    return { x: p.x, y: p.y, z: p.z, qx: p.qx, qy: p.qy, qz: p.qz, qw: p.qw };
-  }
-  const q = quatFromEuler(state.alpha, state.beta, state.gamma);
-  return { x: state.pos.x, y: state.pos.y, z: state.pos.z, qx: q.x, qy: q.y, qz: q.z, qw: q.w };
-}
-
-/* ------------------------- Recording loop -------------------------------- */
-function startRecordingLoop() {
+function startTrajectorySampler() {
   state.startTime = performance.now();
-  state.lastFrameTime = 0; // capture immediately on the first tick
-  state.frames = [];
   state.trajectory = [];
   state.vel = { x: 0, y: 0, z: 0 };
   state.pos = { x: 0, y: 0, z: 0 };
-  state.rafId = requestAnimationFrame(captureTick);
+
+  state.trajTimerId = setInterval(() => {
+    const now = performance.now();
+
+    // Auto-stop at the duration cap to bound memory / file size.
+    if (now - state.startTime >= CONFIG.maxDurationMs) {
+      stopScanning();
+      return;
+    }
+
+    state.trajectory.push({
+      timestamp: (now - state.startTime) / 1000,
+      position: { x: state.pos.x, y: state.pos.y, z: state.pos.z },
+      orientation: { alpha: state.alpha, beta: state.beta, gamma: state.gamma },
+    });
+    updateStatusPanel();
+  }, 1000 / CONFIG.trajectoryRate);
 }
 
-function captureTick(now) {
-  state.rafId = requestAnimationFrame(captureTick);
-
-  // Throttle to the configured FPS.
-  if (now - state.lastFrameTime < state.frameInterval) return;
-  state.lastFrameTime = now;
-
-  // Hard memory cap reached -> finish automatically.
-  if (state.frames.length >= CONFIG.maxFrames) {
-    stopScanning();
-    return;
+function stopTrajectorySampler() {
+  if (state.trajTimerId != null) {
+    clearInterval(state.trajTimerId);
+    state.trajTimerId = null;
   }
-
-  const relTime = (now - state.startTime) / 1000;
-  const pose = getCurrentPose();
-
-  state.trajectory.push({
-    timestamp: relTime,
-    position: { x: pose.x, y: pose.y, z: pose.z },
-    orientation: { alpha: state.alpha, beta: state.beta, gamma: state.gamma },
-  });
-
-  const depth = captureDepthFrame();
-
-  state.frames.push({
-    frameId: state.frames.length,
-    timestamp: relTime,
-    color: captureColorFrame(),
-    depth: depth.data,
-    depthWidth: depth.width,
-    depthHeight: depth.height,
-    pose: { x: pose.x, y: pose.y, z: pose.z, qx: pose.qx, qy: pose.qy, qz: pose.qz, qw: pose.qw },
-  });
-
-  updateStatusPanel();
 }
 
 /* ============================================================================
  * 5. EXPORT — build the .b3dd payload and download it
  * ========================================================================== */
-function buildB3dd() {
+function buildB3dd(videoResult) {
   const now = new Date();
-  const durationSec = Math.max(0.001, (performance.now() - state.startTime) / 1000);
-  const actualFps = Math.round(state.frames.length / durationSec) || CONFIG.targetFps;
+  const durationSec = Math.max(0, (performance.now() - state.startTime) / 1000);
 
   return {
     header: {
       format: "b3dd",
-      version: "1.0",
+      version: "1.1",
       device: "Web Client",
       createdAt: now.toISOString(),
-      frameCount: state.frames.length,
-      fps: actualFps,
+      mimeType: state.mimeType || "video/mp4",
+      durationSec: +durationSec.toFixed(2),
       trajectoryCount: state.trajectory.length,
-      colorResolution: [state.colorW, state.colorH],
-      depthResolution: [state.depthW, state.depthH],
-      depthSource: state.usedXRDepth ? "webxr-depth" : "luminance-fallback",
+      trajectoryRateHz: CONFIG.trajectoryRate,
+      videoBytes: videoResult ? videoResult.bytes : 0,
     },
     trajectory: state.trajectory,
-    frames: state.frames,
+    video: videoResult ? videoResult.dataUrl : null,
   };
 }
 
@@ -910,34 +714,34 @@ async function startScanning() {
   btnStart.textContent = "Initializing…";
 
   try {
+    if (typeof MediaRecorder === "undefined") {
+      throw new Error("Video recording is not supported in this browser.");
+    }
+
     // 1. Motion permission (must be inside this user-gesture call on iOS).
     try {
       await requestMotionPermission();
     } catch (permErr) {
-      // Non-fatal: proceed without trajectory if motion is denied.
+      // Non-fatal: proceed without position data if motion is denied.
       console.warn(permErr.message);
-      showNotice(permErr.message + " Color & depth capture will continue.", "info");
+      showNotice(permErr.message + " Video recording will continue.", "info");
     }
 
-    // 2. Camera.
+    // 2. Camera + recorder + motion + trajectory sampler.
     await startCamera();
-
-    // 3. Optional WebXR (pose + depth) — non-fatal if unavailable.
-    await startXR();
-
-    // 4. Wire up motion + begin capture.
+    state.mimeType = pickMimeType();
+    startRecorder();
     startMotionListeners();
-    setupCanvasSizes();
-    startRecordingLoop();
+    startTrajectorySampler();
 
     setStateUI("recording");
-    btnStart.textContent = "Scanning…";
+    btnStart.textContent = "Recording…";
     btnStop.disabled = false;
-    showNotice("Recording. Move the device slowly around the object, then tap Stop.", "info");
+    showNotice("Recording video + position/rotation. Tap Stop & Download when done.", "info");
   } catch (err) {
     stopCamera();
     stopMotionListeners();
-    stopXR();
+    stopTrajectorySampler();
     setStateUI("error");
     btnStart.disabled = false;
     btnStart.textContent = "Retry";
@@ -945,17 +749,21 @@ async function startScanning() {
   }
 }
 
-function stopScanning() {
+async function stopScanning() {
   if (state.status !== "recording" && state.status !== "starting") return;
 
-  cancelAnimationFrame(state.rafId);
-  state.rafId = null;
+  setStateUI("exporting");
+  btnStop.disabled = true;
+  btnStart.disabled = true;
 
+  stopTrajectorySampler();
   stopMotionListeners();
-  stopCamera();
-  stopXR();
 
-  const data = buildB3dd();
+  // Stop the recorder and base64-encode the video (async).
+  const videoResult = await stopRecorderAndEncode();
+  stopCamera();
+
+  const data = buildB3dd(videoResult);
   downloadB3dd(data);
 
   setStateUI("stopped");
@@ -963,9 +771,11 @@ function stopScanning() {
   btnStart.textContent = "Start Scanning";
   btnStop.disabled = true;
   updateStatusPanel();
+
+  const sizeText = videoResult ? fmtMB(videoResult.bytes) : "0 MB";
   showNotice(
-    "Exported " + data.header.frameCount + " frame(s) as a .b3dd file (~" +
-    (estimateSize() || "—") + "). All processing happened on-device.",
+    "Exported " + data.header.trajectoryCount + " trajectory points and a " +
+    sizeText + " video as a .b3dd file. All processing happened on-device.",
     "info"
   );
 }
@@ -975,12 +785,6 @@ function stopScanning() {
  * ========================================================================== */
 btnStart.addEventListener("click", startScanning);
 btnStop.addEventListener("click", stopScanning);
-video.addEventListener("loadedmetadata", setupCanvasSizes);
-
-// Keep the status panel fresh even between frames.
-setInterval(() => {
-  if (state.status === "recording") updateStatusPanel();
-}, 250);
 
 // Kick off.
 detectCapabilities();
