@@ -1,0 +1,990 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<!--
+  viewport-fit=cover lets the layout use iOS safe-area insets; user-scalable=no
+  gives an app-like feel (double-tap/gesture zoom is disabled on the controls).
+-->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="theme-color" content="#0b0d12" />
+<title>B3DD · 3D Depth &amp; Movement Scanner</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --panel: #141821;
+    --panel-2: #1c212d;
+    --border: #2a3140;
+    --text: #e7ebf3;
+    --muted: #8b93a5;
+    --accent: #4f8cff;
+    --accent-2: #28d17c;
+    --danger: #ff5c6c;
+    --radius: 14px;
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    height: 100%;
+  }
+
+  /* Full-height flex column, centered, with iOS safe-area padding. */
+  body {
+    display: flex;
+    justify-content: center;
+    padding:
+      env(safe-area-inset-top, 0px)
+      env(safe-area-inset-right, 12px)
+      env(safe-area-inset-bottom, 0px)
+      env(safe-area-inset-left, 12px);
+  }
+
+  .app {
+    width: 100%;
+    max-width: 520px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 16px 0 20px;
+    touch-action: manipulation; /* disables double-tap zoom on buttons */
+  }
+
+  h1 {
+    font-size: 1.35rem;
+    font-weight: 700;
+    margin: 0;
+    letter-spacing: -0.02em;
+  }
+  .subtitle {
+    font-size: 0.82rem;
+    color: var(--muted);
+    margin: 2px 0 0;
+    line-height: 1.4;
+  }
+
+  /* ---- Live camera viewport ------------------------------------------- */
+  .viewport {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    min-height: 240px; /* fallback for browsers without aspect-ratio */
+    background: #000;
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  /* playsinline + muted + autoplay (also set as JS attributes) so iOS Safari
+     does not force fullscreen playback. */
+  video {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    background: #000;
+  }
+  .viewport .badge {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: rgba(0,0,0,0.55);
+    color: #cfd6e2;
+    backdrop-filter: blur(4px);
+  }
+  .viewport .badge.live { color: var(--accent-2); }
+  .viewport .badge.live::before {
+    content: "";
+    display: inline-block;
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--accent-2);
+    margin-right: 6px;
+    vertical-align: 1px;
+    animation: pulse 1.2s infinite;
+  }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+
+  /* ---- Status panel ---------------------------------------------------- */
+  .status {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px 16px;
+  }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat .label {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+  .stat .value {
+    font-size: 1.05rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .stat .value.small { font-size: 0.86rem; color: #c6cdda; }
+
+  .caps {
+    grid-column: 1 / -1;
+    font-size: 0.72rem;
+    color: var(--muted);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .caps span {
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+  }
+  .caps span.on { color: var(--accent-2); border-color: rgba(40,209,124,0.4); }
+  .caps span.off { opacity: 0.6; }
+
+  /* ---- Controls -------------------------------------------------------- */
+  .controls {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  button {
+    appearance: none;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 1.02rem;
+    font-weight: 700;
+    padding: 16px 18px;
+    color: #fff;
+    cursor: pointer;
+    transition: transform 0.06s ease, opacity 0.15s ease, background 0.15s ease;
+    width: 100%;
+  }
+  button:active { transform: scale(0.98); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+
+  #btnStart { background: var(--accent); }
+  #btnStop { background: var(--accent-2); color: #04140b; }
+
+  /* ---- Error / hint banner -------------------------------------------- */
+  .notice {
+    font-size: 0.82rem;
+    line-height: 1.45;
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--muted);
+    display: none;
+  }
+  .notice.error {
+    display: block;
+    background: rgba(255,92,108,0.12);
+    border-color: rgba(255,92,108,0.45);
+    color: #ffd7dc;
+  }
+  .notice.info { display: block; }
+
+  .footnote {
+    font-size: 0.7rem;
+    color: var(--muted);
+    line-height: 1.5;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <h1>B3DD Scanner</h1>
+      <p class="subtitle">Capture camera frames, device movement and depth — export a single <code>.b3dd</code> file. 100% on-device.</p>
+    </header>
+
+    <!-- Live camera preview. playsinline/autoplay/muted are also asserted in JS. -->
+    <div class="viewport" id="viewport">
+      <video id="video" playsinline autoplay muted></video>
+      <div class="badge" id="viewBadge">CAMERA OFF</div>
+    </div>
+
+    <!-- Real-time status panel -->
+    <section class="status" aria-label="Status">
+      <div class="stat">
+        <span class="label">Duration</span>
+        <span class="value" id="statDuration">00:00.0</span>
+      </div>
+      <div class="stat">
+        <span class="label">Frames</span>
+        <span class="value" id="statFrames">0</span>
+      </div>
+      <div class="stat">
+        <span class="label">Orientation α/β/γ</span>
+        <span class="value small" id="statOrientation">—</span>
+      </div>
+      <div class="stat">
+        <span class="label">Position x/y/z (m)</span>
+        <span class="value small" id="statPosition">—</span>
+      </div>
+      <div class="stat">
+        <span class="label">Est. export size</span>
+        <span class="value" id="statSize">—</span>
+      </div>
+      <div class="stat">
+        <span class="label">Status</span>
+        <span class="value" id="statState">Idle</span>
+      </div>
+      <div class="caps" id="caps"></div>
+    </section>
+
+    <section class="controls">
+      <button id="btnStart" type="button">Start Scanning</button>
+      <button id="btnStop" type="button" disabled>Stop &amp; Download .b3dd</button>
+    </section>
+
+    <div class="notice" id="notice"></div>
+    <p class="footnote">
+      Requires HTTPS (GitHub Pages provides it). On devices without WebXR depth sensing,
+      a luminance-based depth estimate is recorded from the video stream.
+    </p>
+  </main>
+
+<script>
+/* ============================================================================
+ * B3DD — Browser 3D Depth & Movement Scanner
+ * ----------------------------------------------------------------------------
+ * Single-file, zero-backend scanner for iOS/mobile browsers.
+ *
+ *   Camera   : getUserMedia -> <video> -> offscreen <canvas> (downsampled JPEG)
+ *   Motion   : WebXR getViewerPose (primary) -> DeviceMotion/DeviceOrientation
+ *   Depth    : XRDepthInformation (primary) -> luminance fallback from video
+ *   Export   : JSON object -> Blob -> .b3dd download
+ *
+ * Everything runs client-side; no data ever leaves the device.
+ * ========================================================================== */
+
+"use strict";
+
+/* ------------------------------- Config ---------------------------------- */
+const CONFIG = {
+  targetFps: 10,          // capture cadence (5-10 FPS keeps memory bounded)
+  colorMaxWidth: 640,     // downsampled color frame max width (px)
+  depthMaxWidth: 160,     // depth/grayscale frame max width (px)
+  jpegQuality: 0.70,      // color JPEG quality (0..1)
+  depthQuality: 0.60,     // depth JPEG quality (0..1)
+  maxFrames: 900,         // hard cap => ~90s at 10 FPS, prevents mobile OOM
+  gravity: 9.81,          // m/s^2, used to strip gravity from raw accel
+};
+
+/* ---------------------------- DOM references ------------------------------ */
+const video        = document.getElementById("video");
+const viewBadge    = document.getElementById("viewBadge");
+const btnStart     = document.getElementById("btnStart");
+const btnStop      = document.getElementById("btnStop");
+const noticeEl     = document.getElementById("notice");
+const statDuration = document.getElementById("statDuration");
+const statFrames   = document.getElementById("statFrames");
+const statOrient   = document.getElementById("statOrientation");
+const statPos      = document.getElementById("statPosition");
+const statSize     = document.getElementById("statSize");
+const statState    = document.getElementById("statState");
+const capsEl       = document.getElementById("caps");
+
+/* Offscreen canvases (never shown in the DOM). */
+const colorCanvas = document.createElement("canvas");
+const colorCtx    = colorCanvas.getContext("2d", { willReadFrequently: false });
+const depthCanvas = document.createElement("canvas");
+const depthCtx    = depthCanvas.getContext("2d", { willReadFrequently: true });
+
+/* ----------------------------- App state --------------------------------- */
+const state = {
+  status: "idle",             // idle | starting | recording | stopped | error
+  stream: null,
+  rafId: null,
+  frameInterval: 1000 / CONFIG.targetFps, // ms between captures
+  lastFrameTime: 0,
+  startTime: 0,
+
+  // canvas dimensions (computed from the video stream)
+  colorW: 0, colorH: 0,
+  depthW: 0, depthH: 0,
+
+  // orientation (degrees) & raw acceleration (m/s^2)
+  alpha: 0, beta: 0, gamma: 0,
+  accel: { x: 0, y: 0, z: 0 },
+
+  // dead-reckoning integrators for the fallback pose
+  vel: { x: 0, y: 0, z: 0 },
+  pos: { x: 0, y: 0, z: 0 },
+  lastMotionTime: 0,
+
+  // WebXR
+  xrSession: null,
+  xrReferenceSpace: null,
+  latestXRPose: null,
+  latestXRPoseTime: 0,
+  latestDepthInfo: null,
+  usedXRDepth: false,        // true once a real XR depth buffer is recorded
+
+  // captured data
+  frames: [],
+  trajectory: [],
+};
+
+/* ============================================================================
+ * Capability detection
+ * ========================================================================== */
+function detectCapabilities() {
+  const hasXR = "xr" in navigator && !!navigator.xr;
+  const hasGetUserMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  const hasMotion = "DeviceMotionEvent" in window;
+  const needsMotionPerm =
+    hasMotion &&
+    typeof DeviceMotionEvent.requestPermission === "function";
+
+  const chips = [
+    ["WebXR", hasXR],
+    ["Camera", hasGetUserMedia],
+    ["Motion", hasMotion],
+    ["Motion perm req.", needsMotionPerm],
+  ];
+  capsEl.innerHTML = "";
+  chips.forEach(([label, ok]) => {
+    const s = document.createElement("span");
+    s.textContent = label + ": " + (ok ? "yes" : "no");
+    s.className = ok ? "on" : "off";
+    capsEl.appendChild(s);
+  });
+
+  // WebXR depth sensing support is confirmed asynchronously during start.
+  if (hasXR) {
+    navigator.xr.isSessionSupported("inline")
+      .then((ok) => setChip("Depth session", ok))
+      .catch(() => setChip("Depth session", false));
+  } else {
+    setChip("Depth session", false);
+  }
+  setChip("Depth source", "luminance fallback");
+}
+
+function setChip(label, value) {
+  const txt = label + ": " + value;
+  for (const s of capsEl.children) {
+    if (s.textContent.startsWith(label + ":")) {
+      s.textContent = txt;
+      s.className = String(value) === "yes" ? "on" : "off";
+      return;
+    }
+  }
+  const s = document.createElement("span");
+  s.textContent = txt;
+  capsEl.appendChild(s);
+}
+
+/* ============================================================================
+ * UI helpers
+ * ========================================================================== */
+function showNotice(msg, kind) {
+  noticeEl.textContent = msg;
+  noticeEl.className = "notice " + (kind || "info");
+  noticeEl.style.display = "block";
+}
+function clearNotice() {
+  noticeEl.textContent = "";
+  noticeEl.className = "notice";
+  noticeEl.style.display = "none";
+}
+function setStateUI(s) {
+  statState.textContent = s;
+  state.status = s;
+}
+
+function fmtDuration(ms) {
+  const total = ms / 1000;
+  const m = Math.floor(total / 60);
+  const sec = (total % 60).toFixed(1);
+  return String(m).padStart(2, "0") + ":" + String(sec).padStart(4, "0");
+}
+function fmt(v, d) {
+  return (v == null || !isFinite(v)) ? "—" : Number(v).toFixed(d == null ? 2 : d);
+}
+
+function updateStatusPanel() {
+  statFrames.textContent = String(state.frames.length);
+  statOrient.textContent =
+    fmt(state.alpha, 0) + "° / " + fmt(state.beta, 0) + "° / " + fmt(state.gamma, 0) + "°";
+  statPos.textContent = fmt(state.pos.x) + " / " + fmt(state.pos.y) + " / " + fmt(state.pos.z);
+  if (state.status === "recording") {
+    statDuration.textContent = fmtDuration(performance.now() - state.startTime);
+    statSize.textContent = estimateSize();
+  }
+}
+
+/* Rough export-size estimate so users can see memory usage live. */
+function estimateSize() {
+  let bytes = 512; // header + trajectory overhead
+  state.frames.forEach((f) => {
+    bytes += (f.color ? f.color.length : 0) * 0.75; // base64 -> ~3/4 bytes
+    bytes += (f.depth ? f.depth.length : 0) * 0.75;
+    bytes += 160;
+  });
+  state.trajectory.forEach(() => (bytes += 96));
+  if (bytes < 1024) return "—";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+/* ============================================================================
+ * 1. CAMERA — getUserMedia
+ * ========================================================================== */
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error("Camera access is not available in this browser.");
+  }
+  // Prefer the back (environment) camera; fall back to any available camera.
+  const constraints = {
+    audio: false,
+    video: {
+      facingMode: { ideal: "environment" },
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+    },
+  };
+  try {
+    state.stream = await navigator.mediaDevices.getUserMedia(constraints);
+  } catch (err) {
+    // Some devices reject the "ideal" facingMode — retry with plain video.
+    try {
+      state.stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+    } catch (err2) {
+      throw new Error("Camera permission was denied or the camera is unavailable.");
+    }
+  }
+
+  // iOS requires playsinline + muted + autoplay (both attribute and property).
+  video.setAttribute("playsinline", "");
+  video.setAttribute("muted", "");
+  video.setAttribute("autoplay", "");
+  video.playsInline = true;
+  video.muted = true;
+  video.srcObject = state.stream;
+  try { await video.play(); } catch (_) { /* muted autoplay should never reject */ }
+  viewBadge.textContent = "LIVE";
+  viewBadge.classList.add("live");
+}
+
+function stopCamera() {
+  if (state.stream) {
+    state.stream.getTracks().forEach((t) => t.stop());
+    state.stream = null;
+  }
+  if (video.srcObject) video.srcObject = null;
+  viewBadge.textContent = "CAMERA OFF";
+  viewBadge.classList.remove("live");
+}
+
+/* ============================================================================
+ * 2. MOTION — permissions + listeners (iOS specifics)
+ * ========================================================================== */
+
+/*
+ * On iOS 13+ the motion sensors are permission-gated and MUST be requested
+ * from within a user-gesture handler. On other platforms these functions do
+ * not exist, so this resolves immediately.
+ */
+async function requestMotionPermission() {
+  const results = [];
+  if (typeof DeviceOrientationEvent !== "undefined" &&
+      typeof DeviceOrientationEvent.requestPermission === "function") {
+    results.push(await DeviceOrientationEvent.requestPermission());
+  }
+  if (typeof DeviceMotionEvent !== "undefined" &&
+      typeof DeviceMotionEvent.requestPermission === "function") {
+    results.push(await DeviceMotionEvent.requestPermission());
+  }
+  if (results.some((r) => r !== "granted")) {
+    // Permission may be "denied" or absent — motion will simply be unavailable.
+    throw new Error("Motion & orientation permission was denied. Trajectory tracking disabled.");
+  }
+}
+
+function startMotionListeners() {
+  window.addEventListener("deviceorientation", onDeviceOrientation, true);
+  window.addEventListener("devicemotion", onDeviceMotion, true);
+}
+function stopMotionListeners() {
+  window.removeEventListener("deviceorientation", onDeviceOrientation, true);
+  window.removeEventListener("devicemotion", onDeviceMotion, true);
+}
+
+/* Orientation: alpha (z, heading), beta (x, pitch), gamma (y, roll) in degrees. */
+function onDeviceOrientation(e) {
+  // iOS may emit null values briefly — keep the previous reading.
+  if (e.alpha != null) state.alpha = e.alpha;
+  if (e.beta  != null) state.beta  = e.beta;
+  if (e.gamma != null) state.gamma = e.gamma;
+}
+
+/* Acceleration: integrate gravity-free acceleration into a world-space position. */
+function onDeviceMotion(e) {
+  const incl = e.accelerationIncludingGravity;
+  if (!incl) return;
+
+  let lin = e.acceleration; // already gravity-free on most iOS builds
+  const q = quatFromEuler(state.alpha, state.beta, state.gamma);
+
+  if (!lin || lin.x == null || lin.y == null || lin.z == null) {
+    // Fallback: estimate gravity in the device frame using the current
+    // attitude and subtract it from the raw reading.
+    const gDevice = quatRotate(quatConjugate(q), { x: 0, y: 0, z: CONFIG.gravity });
+    lin = {
+      x: incl.x - gDevice.x,
+      y: incl.y - gDevice.y,
+      z: incl.z - gDevice.z,
+    };
+  }
+
+  // Rotate linear acceleration into the world frame.
+  const aWorld = quatRotate(q, { x: lin.x || 0, y: lin.y || 0, z: lin.z || 0 });
+
+  // Dead-reckoning double integration. NOTE: this drifts over time and is
+  // only an approximation — WebXR poses replace it when available.
+  const now = performance.now();
+  const dt = state.lastMotionTime
+    ? Math.min(0.1, (now - state.lastMotionTime) / 1000)
+    : 0;
+  state.lastMotionTime = now;
+
+  state.vel.x += aWorld.x * dt;
+  state.vel.y += aWorld.y * dt;
+  state.vel.z += aWorld.z * dt;
+  state.pos.x += state.vel.x * dt;
+  state.pos.y += state.vel.y * dt;
+  state.pos.z += state.vel.z * dt;
+
+  state.accel = { x: incl.x, y: incl.y, z: incl.z };
+}
+
+/* ------------------------- Quaternion helpers ---------------------------- */
+const DEG2RAD = Math.PI / 180;
+
+/* ZYX intrinsic (yaw-pitch-roll) Euler -> quaternion, matching the
+ * DeviceOrientation convention: alpha≈yaw, beta≈pitch, gamma≈roll. */
+function quatFromEuler(alphaDeg, betaDeg, gammaDeg) {
+  const a = alphaDeg * DEG2RAD / 2;
+  const b = betaDeg  * DEG2RAD / 2;
+  const g = gammaDeg * DEG2RAD / 2;
+  const ca = Math.cos(a), sa = Math.sin(a);
+  const cb = Math.cos(b), sb = Math.sin(b);
+  const cg = Math.cos(g), sg = Math.sin(g);
+  return {
+    x: sg * cb * ca - cg * sb * sa,
+    y: cg * sb * ca + sg * cb * sa,
+    z: cg * cb * sa - sg * sb * ca,
+    w: cg * cb * ca + sg * sb * sa,
+  };
+}
+function quatConjugate(q) { return { w: q.w, x: -q.x, y: -q.y, z: -q.z }; }
+function quatMultiply(a, b) {
+  return {
+    w: a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z,
+    x: a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+    y: a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+    z: a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+  };
+}
+/* Rotate vector v by quaternion q (q * v * q^-1). */
+function quatRotate(q, v) {
+  const p = { w: 0, x: v.x, y: v.y, z: v.z };
+  const r = quatMultiply(quatMultiply(q, p), quatConjugate(q));
+  return { x: r.x, y: r.y, z: r.z };
+}
+
+/* ============================================================================
+ * 3. WebXR — primary pose + depth path (optional; falls back cleanly)
+ * ========================================================================== */
+
+/*
+ * WebXR is the primary metric source when supported. We request an *inline*
+ * session (rather than immersive-ar) so it can coexist with the DOM camera
+ * preview. On iOS Safari `navigator.xr` does not exist, so this whole path is
+ * skipped and the DeviceMotion fallback is used instead.
+ */
+async function startXR() {
+  if (!navigator.xr) { setChip("Depth source", "luminance fallback"); return; }
+  try {
+    const ok = await navigator.xr.isSessionSupported("inline");
+    if (!ok) { setChip("Depth source", "luminance fallback"); return; }
+
+    const session = await navigator.xr.requestSession("inline", {
+      optionalFeatures: ["depth-sensing"],
+      depthSensing: {
+        usagePreference: ["cpu-optimized", "gpu-optimized"],
+        dataFormatPreference: ["luminance-alpha", "float32"],
+      },
+    });
+    state.xrSession = session;
+    state.xrReferenceSpace = await session.requestReferenceSpace("local");
+    setChip("Depth session", "yes");
+    session.requestAnimationFrame(onXRFrame);
+  } catch (err) {
+    // WebXR unavailable or rejected — silently use the fallback pipeline.
+    console.warn("WebXR unavailable:", err);
+    state.xrSession = null;
+    setChip("Depth source", "luminance fallback");
+  }
+}
+
+function onXRFrame(time, frame) {
+  if (!state.xrSession) return;
+  state.xrSession.requestAnimationFrame(onXRFrame);
+
+  // --- Pose -------------------------------------------------------------
+  const pose = frame.getViewerPose(state.xrReferenceSpace);
+  if (pose && pose.transform) {
+    const p = pose.transform.position;
+    const o = pose.transform.orientation;
+    state.latestXRPose = { x: p.x, y: p.y, z: p.z, qx: o.x, qy: o.y, qz: o.z, qw: o.w };
+    state.latestXRPoseTime = performance.now();
+  }
+
+  // --- Depth (XRDepthInformation) ---------------------------------------
+  try {
+    if (pose && typeof frame.getDepthInformation === "function") {
+      for (const view of pose.views) {
+        const depthInfo = frame.getDepthInformation(view);
+        if (depthInfo) {
+          state.latestDepthInfo = depthInfo;
+          break;
+        }
+      }
+    }
+  } catch (_) { /* depth not provided this frame */ }
+}
+
+function stopXR() {
+  if (state.xrSession) {
+    try { state.xrSession.end(); } catch (_) { /* already ended */ }
+    state.xrSession = null;
+  }
+}
+
+/* Convert an XRDepthInformation buffer into a normalized grayscale canvas
+ * image. Near surfaces are bright, far surfaces are dark. */
+function renderXRDepth(depthInfo) {
+  const w = depthInfo.width;
+  const h = depthInfo.height;
+  if (!w || !h) return { data: null, width: 0, height: 0 };
+
+  depthCanvas.width = w;
+  depthCanvas.height = h;
+  const img = depthCtx.createImageData(w, h);
+
+  const data = depthInfo.data;
+  const toMeters = typeof depthInfo.rawValueToMeters === "function"
+    ? depthInfo.rawValueToMeters
+    : (v) => v;
+
+  // First pass: min/max in meters for normalization.
+  let min = Infinity, max = -Infinity;
+  const meters = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const raw = data instanceof Float32Array ? data[i] : data[i * 2]; // luminance-alpha -> first byte
+    const m = toMeters(raw);
+    meters[i] = m;
+    if (m < min) min = m;
+    if (m > max) max = m;
+  }
+  const range = max - min || 1;
+
+  // Second pass: map to 0..255 grayscale (inverted: near = bright).
+  for (let i = 0; i < w * h; i++) {
+    const v = Math.max(0, Math.min(255, Math.round(((max - meters[i]) / range) * 255)));
+    img.data[i * 4]     = v;
+    img.data[i * 4 + 1] = v;
+    img.data[i * 4 + 2] = v;
+    img.data[i * 4 + 3] = 255;
+  }
+  depthCtx.putImageData(img, 0, 0);
+
+  return {
+    data: depthCanvas.toDataURL("image/jpeg", CONFIG.depthQuality),
+    width: w,
+    height: h,
+  };
+}
+
+/* ============================================================================
+ * 4. FRAME CAPTURE — color + depth downsampling (memory safeguards)
+ * ========================================================================== */
+
+/* Compute downsampled canvas sizes from the native video resolution once the
+ * stream's metadata arrives. */
+function setupCanvasSizes() {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return;
+
+  const colorScale = Math.min(1, CONFIG.colorMaxWidth / vw);
+  state.colorW = Math.max(1, Math.round(vw * colorScale));
+  state.colorH = Math.max(1, Math.round(vh * colorScale));
+  colorCanvas.width = state.colorW;
+  colorCanvas.height = state.colorH;
+
+  const depthScale = CONFIG.depthMaxWidth / vw;
+  state.depthW = Math.max(1, Math.round(vw * depthScale));
+  state.depthH = Math.max(1, Math.round(vh * depthScale));
+  depthCanvas.width = state.depthW;
+  depthCanvas.height = state.depthH;
+}
+
+/* Draw the current video frame into the downsampled color canvas and return a
+ * JPEG data URL. Small resolution + JPEG keeps the capture memory-light. */
+function captureColorFrame() {
+  colorCtx.drawImage(video, 0, 0, state.colorW, state.colorH);
+  return colorCanvas.toDataURL("image/jpeg", CONFIG.jpegQuality);
+}
+
+/* Depth for this frame:
+ *   - Prefer a fresh XRDepthInformation buffer (real metric depth).
+ *   - Otherwise downsample the color frame and keep its luminance as a
+ *     cheap "depth proxy" (brighter = closer is only approximate). */
+function captureDepthFrame() {
+  const fresh = state.latestDepthInfo &&
+    (performance.now() - state.latestXRPoseTime) < 250;
+  if (fresh) {
+    state.usedXRDepth = true;
+    setChip("Depth source", "webxr-depth");
+    return renderXRDepth(state.latestDepthInfo);
+  }
+
+  // Luminance fallback.
+  depthCanvas.width = state.depthW;
+  depthCanvas.height = state.depthH;
+  depthCtx.drawImage(video, 0, 0, state.depthW, state.depthH);
+  const img = depthCtx.getImageData(0, 0, state.depthW, state.depthH);
+  const d = img.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const lum = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+    d[i] = d[i + 1] = d[i + 2] = lum;
+  }
+  depthCtx.putImageData(img, 0, 0);
+  return {
+    data: depthCanvas.toDataURL("image/jpeg", CONFIG.depthQuality),
+    width: state.depthW,
+    height: state.depthH,
+  };
+}
+
+/* Current metric pose: WebXR if fresh, else the integrated fallback pose
+ * combined with a quaternion derived from the live orientation. */
+function getCurrentPose() {
+  if (state.latestXRPose &&
+      (performance.now() - state.latestXRPoseTime) < 250) {
+    const p = state.latestXRPose;
+    return { x: p.x, y: p.y, z: p.z, qx: p.qx, qy: p.qy, qz: p.qz, qw: p.qw };
+  }
+  const q = quatFromEuler(state.alpha, state.beta, state.gamma);
+  return { x: state.pos.x, y: state.pos.y, z: state.pos.z, qx: q.x, qy: q.y, qz: q.z, qw: q.w };
+}
+
+/* ------------------------- Recording loop -------------------------------- */
+function startRecordingLoop() {
+  state.startTime = performance.now();
+  state.lastFrameTime = 0; // capture immediately on the first tick
+  state.frames = [];
+  state.trajectory = [];
+  state.vel = { x: 0, y: 0, z: 0 };
+  state.pos = { x: 0, y: 0, z: 0 };
+  state.rafId = requestAnimationFrame(captureTick);
+}
+
+function captureTick(now) {
+  state.rafId = requestAnimationFrame(captureTick);
+
+  // Throttle to the configured FPS.
+  if (now - state.lastFrameTime < state.frameInterval) return;
+  state.lastFrameTime = now;
+
+  // Hard memory cap reached -> finish automatically.
+  if (state.frames.length >= CONFIG.maxFrames) {
+    stopScanning();
+    return;
+  }
+
+  const relTime = (now - state.startTime) / 1000;
+  const pose = getCurrentPose();
+
+  state.trajectory.push({
+    timestamp: relTime,
+    position: { x: pose.x, y: pose.y, z: pose.z },
+    orientation: { alpha: state.alpha, beta: state.beta, gamma: state.gamma },
+  });
+
+  const depth = captureDepthFrame();
+
+  state.frames.push({
+    frameId: state.frames.length,
+    timestamp: relTime,
+    color: captureColorFrame(),
+    depth: depth.data,
+    depthWidth: depth.width,
+    depthHeight: depth.height,
+    pose: { x: pose.x, y: pose.y, z: pose.z, qx: pose.qx, qy: pose.qy, qz: pose.qz, qw: pose.qw },
+  });
+
+  updateStatusPanel();
+}
+
+/* ============================================================================
+ * 5. EXPORT — build the .b3dd payload and download it
+ * ========================================================================== */
+function buildB3dd() {
+  const now = new Date();
+  const durationSec = Math.max(0.001, (performance.now() - state.startTime) / 1000);
+  const actualFps = Math.round(state.frames.length / durationSec) || CONFIG.targetFps;
+
+  return {
+    header: {
+      format: "b3dd",
+      version: "1.0",
+      device: "Web Client",
+      createdAt: now.toISOString(),
+      frameCount: state.frames.length,
+      fps: actualFps,
+      trajectoryCount: state.trajectory.length,
+      colorResolution: [state.colorW, state.colorH],
+      depthResolution: [state.depthW, state.depthH],
+      depthSource: state.usedXRDepth ? "webxr-depth" : "luminance-fallback",
+    },
+    trajectory: state.trajectory,
+    frames: state.frames,
+  };
+}
+
+function downloadB3dd(data) {
+  const json = JSON.stringify(data);
+  const blob = new Blob([json], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+
+  // timestamp: capture_YYYYMMDD-HHMMSS.b3dd
+  const ts = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "capture_" + ts + ".b3dd";
+  document.body.appendChild(a);
+  a.click();
+
+  setTimeout(() => {
+    URL.revokeObjectURL(url);
+    a.remove();
+  }, 2000);
+}
+
+/* ============================================================================
+ * 6. START / STOP flow
+ * ========================================================================== */
+async function startScanning() {
+  if (state.status === "starting" || state.status === "recording") return;
+  clearNotice();
+  setStateUI("starting");
+  btnStart.disabled = true;
+  btnStart.textContent = "Initializing…";
+
+  try {
+    // 1. Motion permission (must be inside this user-gesture call on iOS).
+    try {
+      await requestMotionPermission();
+    } catch (permErr) {
+      // Non-fatal: proceed without trajectory if motion is denied.
+      console.warn(permErr.message);
+      showNotice(permErr.message + " Color & depth capture will continue.", "info");
+    }
+
+    // 2. Camera.
+    await startCamera();
+
+    // 3. Optional WebXR (pose + depth) — non-fatal if unavailable.
+    await startXR();
+
+    // 4. Wire up motion + begin capture.
+    startMotionListeners();
+    setupCanvasSizes();
+    startRecordingLoop();
+
+    setStateUI("recording");
+    btnStart.textContent = "Scanning…";
+    btnStop.disabled = false;
+    showNotice("Recording. Move the device slowly around the object, then tap Stop.", "info");
+  } catch (err) {
+    stopCamera();
+    stopMotionListeners();
+    stopXR();
+    setStateUI("error");
+    btnStart.disabled = false;
+    btnStart.textContent = "Retry";
+    showNotice(err.message || "Failed to start.", "error");
+  }
+}
+
+function stopScanning() {
+  if (state.status !== "recording" && state.status !== "starting") return;
+
+  cancelAnimationFrame(state.rafId);
+  state.rafId = null;
+
+  stopMotionListeners();
+  stopCamera();
+  stopXR();
+
+  const data = buildB3dd();
+  downloadB3dd(data);
+
+  setStateUI("stopped");
+  btnStart.disabled = false;
+  btnStart.textContent = "Start Scanning";
+  btnStop.disabled = true;
+  updateStatusPanel();
+  showNotice(
+    "Exported " + data.header.frameCount + " frame(s) as a .b3dd file (~" +
+    (estimateSize() || "—") + "). All processing happened on-device.",
+    "info"
+  );
+}
+
+/* ============================================================================
+ * Wire up events
+ * ========================================================================== */
+btnStart.addEventListener("click", startScanning);
+btnStop.addEventListener("click", stopScanning);
+video.addEventListener("loadedmetadata", setupCanvasSizes);
+
+// Keep the status panel fresh even between frames.
+setInterval(() => {
+  if (state.status === "recording") updateStatusPanel();
+}, 250);
+
+// Kick off.
+detectCapabilities();
+setStateUI("Idle");
+</script>
+</body>
+</html>
